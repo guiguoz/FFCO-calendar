@@ -197,11 +197,31 @@ class FFCCalendarSync {
         $cols = $this->detect_columns($xpath);
         $this->add_log('Colonnes : ' . $this->format_columns($cols));
 
+        // Contrôle structurel : une ligne de données doit comporter autant de
+        // cellules que l'en-tête. C'est ce qui trahit immédiatement un décalage.
+        $header_cells = $this->count_header_cells($xpath);
+        $first_cells  = $xpath->query('.//th | .//td', $rows->item(0));
+        $data_cells   = $first_cells ? $first_cells->length : 0;
+        $this->add_log(sprintf(
+            "Cellules : %d par ligne de données, %d dans l'en-tête.",
+            $data_cells, $header_cells
+        ));
+        if ($header_cells > 0 && $data_cells !== $header_cells) {
+            $this->add_log(sprintf(
+                "DÉCALAGE : %d cellules de données pour %d colonnes d'en-tête — la correspondance "
+                . 'des colonnes est fausse, le tableau CN a changé de structure.',
+                $data_cells, $header_cells
+            ));
+        }
+
         $sample     = null;
         $nb_no_link = 0;
 
         foreach ($rows as $row) {
-            $cells = $xpath->query('.//td', $row);
+            // th ET td : le CN sert la colonne « Course » dans un <th scope="row">.
+            // Ne sélectionner que les <td> la saute et décale toutes les colonnes
+            // d'un cran vers la gauche. L'union XPath conserve l'ordre du document.
+            $cells = $xpath->query('.//th | .//td', $row);
             if ($cells->length < 4) {
                 continue;
             }
@@ -322,6 +342,30 @@ class FFCCalendarSync {
      * Détermine l'index de chaque colonne d'après la ligne d'en-tête, avec repli
      * sur l'ordre connu. Résiste à un ajout ou à un réordonnancement côté CN.
      */
+    /**
+     * Ligne d'en-tête du tableau : <thead> d'abord, sinon la première ligne
+     * contenant des <th>. Les lignes de données du CN contiennent elles aussi un
+     * <th scope="row"> (colonne « Course »), d'où cette précaution.
+     */
+    private function find_header_row(DOMXPath $xpath): ?DOMElement {
+        $row = $xpath->query('//table/thead//tr[th]')->item(0);
+        if ($row instanceof DOMElement) {
+            return $row;
+        }
+        $row = $xpath->query('//table//tr[th]')->item(0);
+        return $row instanceof DOMElement ? $row : null;
+    }
+
+    /** Nombre de cellules de la ligne d'en-tête (0 si en-tête introuvable). */
+    private function count_header_cells(DOMXPath $xpath): int {
+        $header_row = $this->find_header_row($xpath);
+        if ($header_row === null) {
+            return 0;
+        }
+        $cells = $xpath->query('.//th | .//td', $header_row);
+        return $cells ? $cells->length : 0;
+    }
+
     private function detect_columns(DOMXPath $xpath): array {
         $cols = [
             'date' => 0, 'course' => 1, 'lieu' => 2, 'organisateur' => 3,
@@ -330,8 +374,8 @@ class FFCCalendarSync {
             'departement' => -1,
         ];
 
-        $header_row = $xpath->query('//table//tr[th]')->item(0);
-        if (!$header_row) {
+        $header_row = $this->find_header_row($xpath);
+        if ($header_row === null) {
             $this->add_log('En-tête du tableau absent : ordre de colonnes par défaut supposé.');
             return $cols;
         }
