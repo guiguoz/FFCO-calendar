@@ -110,15 +110,105 @@ class FFCEventsCalendarSyncVikazim2 {
     }
 
     /**
-     * Récupère la liste des courses CN (une seule page, pas de pagination),
-     * puis applique la fenêtre temporelle (mois courant + 2 suivants par défaut).
+     * Récupère la liste des courses CN.
+     *
+     * La page CN n'affiche qu'UNE saison à la fois (?season=AAAA). Comme la
+     * fenêtre de scan peut chevaucher deux saisons (ex. nov. 2026 → janv. 2027),
+     * on interroge chaque année couverte par la fenêtre puis on fusionne.
      */
     private function fetchFFCEvents() {
         $this->output("🌐 Début récupération événements FFCOrientation (CN)...");
-        $url = $this->ffc_url;
 
-        $this->output("📥 Téléchargement de la liste des courses...");
-        $this->output("🔗 URL: $url");
+        // Étape 1 — Fenêtre temporelle : mois courant + 2 mois suivants
+        $mode = $this->scan_window['mode'] ?? 'current_and_next_month';
+        $start_window = new DateTime('first day of this month 00:00:00');
+        $end_window = (new DateTime('first day of this month'))->modify('+2 months')->modify('last day of this month 23:59:59');
+        $this->output("🗓️ Fenêtre ($mode): " . $start_window->format('Y-m-d') . " → " . $end_window->format('Y-m-d'));
+
+        // Étape 2 — Une requête par saison, c.-à-d. par année couverte par la fenêtre
+        $seasons = range((int) $start_window->format('Y'), (int) $end_window->format('Y'));
+        $this->output("📅 Saisons à interroger: " . implode(', ', $seasons));
+
+        $rows = 0; $min_date = null; $max_date = null; $nb_normandie = 0; $nb_national = 0;
+        $events = []; $seen = []; $failed = [];
+
+        $accumulate = function ($result, $label) use (&$events, &$seen, &$rows, &$min_date, &$max_date, &$nb_normandie, &$nb_national) {
+            $rows         += $result['total'];
+            $nb_normandie += $result['normandie'];
+            $nb_national  += $result['national'];
+            if ($result['min_date'] && ($min_date === null || $result['min_date'] < $min_date)) { $min_date = $result['min_date']; }
+            if ($result['max_date'] && ($max_date === null || $result['max_date'] > $max_date)) { $max_date = $result['max_date']; }
+
+            $added = 0;
+            foreach ($result['events'] as $event) {
+                $key = $this->eventKey($event);
+                if (isset($seen[$key])) { continue; }
+                $seen[$key] = true;
+                $events[] = $event;
+                $added++;
+            }
+            $this->output("   ↳ $label : " . $result['total'] . " lignes, dont $added Normandie/nationales");
+        };
+
+        foreach ($seasons as $season) {
+            $html = $this->downloadPage($this->ffc_url . '?season=' . $season);
+            if ($html === null) { $failed[] = $season; continue; }
+            $accumulate($this->parseEvents($html), "Saison $season");
+        }
+
+        // Étape 3 — Filet de sécurité : si ?season= n'a rien donné, on tente la page par défaut
+        if ($rows === 0) {
+            $this->output("⚠️ Aucune ligne obtenue via ?season= — essai sur la page par défaut");
+            $html = $this->downloadPage($this->ffc_url);
+            if ($html !== null) { $accumulate($this->parseEvents($html), "Page par défaut"); }
+        }
+
+        // Étape 4 — Application de la fenêtre temporelle
+        $in_window = [];
+        foreach ($events as $event) {
+            try { $dt = new DateTime($event['date']); } catch (Exception $ex) { continue; }
+            if ($dt >= $start_window && $dt <= $end_window) { $in_window[] = $event; }
+        }
+
+        // Étape 5 — Bilan détaillé, pour comprendre immédiatement un résultat à 0
+        $this->output("🔎 Bilan :");
+        $this->output("   • Lignes lues : $rows" . ($failed ? " (saisons injoignables : " . implode(', ', $failed) . ")" : ""));
+        if ($min_date && $max_date) {
+            $this->output("   • Dates trouvées : du " . substr($min_date, 0, 10) . " au " . substr($max_date, 0, 10));
+        }
+        $this->output("   • Normandie (" . implode(', ', $this->target_departments) . ") : $nb_normandie");
+        $this->output("   • Nationales (groupe " . implode('/', $this->national_groups) . " ou mots-clés) : $nb_national");
+        $this->output("   • Dans la fenêtre : " . count($in_window));
+
+        // Détail des événements retenus (utile pour vérifier le filtrage)
+        if (count($in_window) > 0 && count($in_window) <= 20) {
+            foreach ($in_window as $event) {
+                $this->output("      – " . substr($event['date'], 0, 10)
+                    . " | " . $event['title']
+                    . " | dép. " . ($event['department'] ?: '?')
+                    . " | groupe " . ($event['groupe'] ?: '?')
+                    . (!empty($event['is_national']) ? " [national]" : ""));
+            }
+        }
+
+        if (count($in_window) === 0) {
+            $this->output("ℹ️ Aucun événement à synchroniser sur cette période.");
+            if ($max_date && $max_date < $end_window->format('Y-m-d H:i:s')) {
+                $this->output("   ⚠️ La dernière course publiée (" . substr($max_date, 0, 10) . ") est antérieure à la fin de fenêtre :");
+                $this->output("      la saison " . $end_window->format('Y') . " n'est sans doute pas encore publiée sur cn.ffcorientation.fr.");
+                $this->output("      Ce n'est pas un bug — la synchro reprendra dès publication du calendrier.");
+            }
+        }
+
+        $this->output("  ✅ " . count($in_window) . " événements retenus sur $rows lignes");
+        return $in_window;
+    }
+
+    /**
+     * Télécharge une page et renvoie son HTML (null en cas d'échec).
+     */
+    private function downloadPage($url) {
+        $this->output("📥 Téléchargement: $url");
 
         $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $url);
@@ -129,34 +219,24 @@ class FFCEventsCalendarSyncVikazim2 {
 
         $html = curl_exec($ch);
         $curl_error = curl_error($ch);
+        $http_code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
         if (!$html) {
-            $this->output("⚠️ Erreur de téléchargement: $curl_error");
-            return [];
+            $this->output("   ⚠️ Échec (HTTP $http_code) : $curl_error");
+            return null;
         }
 
-        $this->output("📄 HTML téléchargé: " . strlen($html) . " caractères");
+        $this->output("   📄 " . strlen($html) . " caractères (HTTP $http_code)");
+        return $html;
+    }
 
-        $this->output("🔍 Analyse des événements...");
-        $result = $this->parseEvents($html);
-        $events = $result['events'];
-        $total = $result['total'];
-
-        // Fenêtre temporelle : mois courant + 2 mois suivants (mode par défaut)
-        $mode = $this->scan_window['mode'] ?? 'current_and_next_month';
-        if ($mode === 'current_and_next_month') {
-            $start_window = new DateTime('first day of this month 00:00:00');
-            $end_window = (new DateTime('first day of this month'))->modify('+2 months')->modify('last day of this month 23:59:59');
-            $this->output("🗓️ Fenêtre: " . $start_window->format('Y-m-d') . " → " . $end_window->format('Y-m-d'));
-            $events = array_values(array_filter($events, function($e) use ($start_window, $end_window) {
-                try { $dt = new DateTime($e['date']); } catch (Exception $ex) { return false; }
-                return $dt >= $start_window && $dt <= $end_window;
-            }));
-        }
-
-        $this->output("  ✅ " . count($events) . " événements retenus sur $total lignes");
-        return $events;
+    /**
+     * Clé d'unicité d'une course, pour fusionner plusieurs saisons sans doublon.
+     */
+    private function eventKey($event) {
+        if (!empty($event['link'])) { return $this->normalizeUrl($event['link']); }
+        return strtolower($event['title']) . '|' . $event['date'] . '|' . strtolower($event['location']);
     }
 
     /**
@@ -164,26 +244,37 @@ class FFCEventsCalendarSyncVikazim2 {
      * Groupe | Spécialité | Épreuve | Résultats.
      */
     private function parseEvents($html) {
-        $this->output("🔍 Début parsing HTML...");
-        $events = [];
         $dom = new DOMDocument();
         @$dom->loadHTML($html);
         $xpath = new DOMXPath($dom);
         $eventNodes = $xpath->query('//table//tr[position()>1]');
 
+        $stats = [
+            'events' => [], 'total' => 0, 'normandie' => 0, 'national' => 0,
+            'min_date' => null, 'max_date' => null,
+        ];
+
         if (!$eventNodes || $eventNodes->length === 0) {
-            $this->output("  ⚠️ Aucune ligne trouvée dans le tableau (structure modifiée ?)");
-            return ['events' => [], 'total' => 0];
+            $this->output("   ⚠️ Aucune ligne trouvée dans le tableau (saison non publiée ou structure modifiée)");
+            return $stats;
         }
 
         foreach ($eventNodes as $node) {
             $event = $this->extractEventData($node, $xpath);
-            if ($event && $event['title'] && $this->isEventAllowed($event)) {
-                $events[] = $event;
-            }
+            if (!$event || !$event['title'] || !$event['date']) { continue; }
+
+            $stats['total']++;
+            if ($stats['min_date'] === null || $event['date'] < $stats['min_date']) { $stats['min_date'] = $event['date']; }
+            if ($stats['max_date'] === null || $event['date'] > $stats['max_date']) { $stats['max_date'] = $event['date']; }
+
+            $is_normandie = $event['department'] && in_array($event['department'], $this->target_departments, true);
+            if ($is_normandie) { $stats['normandie']++; }
+            if (!empty($event['is_national'])) { $stats['national']++; }
+
+            if ($is_normandie || !empty($event['is_national'])) { $stats['events'][] = $event; }
         }
 
-        return ['events' => $events, 'total' => $eventNodes->length];
+        return $stats;
     }
 
     private function extractEventData($node, $xpath) {
@@ -256,12 +347,6 @@ class FFCEventsCalendarSyncVikazim2 {
                 return true;
             }
         }
-        return false;
-    }
-
-    private function isEventAllowed($event) {
-        if ($event['department'] && in_array($event['department'], $this->target_departments)) { return true; }
-        if (!empty($event['is_national'])) { return true; }
         return false;
     }
 
