@@ -53,36 +53,46 @@ class FFCCalendarSync {
 
         $filtered = $this->filter_normandie($events);
 
-        // Seules les courses à venir sont purgées puis réinsérées. Les courses
-        // passées restent en base telles quelles : les réinsérer créerait des
-        // doublons, leur identifiant ayant changé avec le changement de source.
-        $today    = date('Y-m-d');
-        $upcoming = [];
+        // La source CN publie une saison entière d'un coup (année civile) : on
+        // remplace chaque année réellement récupérée, courses passées comprises,
+        // afin que le calendrier affiche aussi les mois déjà écoulés. Une année
+        // dont la page est injoignable n'est pas touchée — aucune perte de données.
+        $cutoff  = date('Y-m-d', strtotime('-' . FFCCalendarDB::RETENTION_MONTHS . ' months'));
+        $by_year = [];
+        $skipped = 0;
+
         foreach ($filtered as $event) {
-            if (($event['event_date'] ?? '') >= $today) {
-                $upcoming[] = $event;
+            if ($event['event_date'] < $cutoff) {
+                $skipped++; // cleanup_old_events() les supprimerait aussitôt
+                continue;
             }
+            $by_year[(int) substr($event['event_date'], 0, 4)][] = $event;
         }
+        ksort($by_year);
 
         $this->add_log(sprintf(
-            'Récupérés : %d courses CN → %d après filtrage Normandie + national → %d à venir (%d passées laissées en base).',
+            'Récupérés : %d courses CN → %d après filtrage Normandie + national → %d à insérer (depuis %s, %d trop anciennes ignorées).',
             count($events),
             count($filtered),
-            count($upcoming),
-            count($filtered) - count($upcoming)
+            count($filtered) - $skipped,
+            $cutoff,
+            $skipped
         ));
 
-        // Purge future events before reinserting — prevents stale data from broken syncs
-        FFCCalendarDB::delete_future_events();
-
-        foreach ($upcoming as $event) {
-            FFCCalendarDB::upsert_event($event);
+        $inserted = 0;
+        foreach ($by_year as $year => $year_events) {
+            FFCCalendarDB::delete_events_for_year((int) $year);
+            foreach ($year_events as $event) {
+                FFCCalendarDB::upsert_event($event);
+                $inserted++;
+            }
+            $this->add_log(sprintf('Année %d : %d événements réinsérés.', $year, count($year_events)));
         }
 
         FFCCalendarDB::cleanup_old_events();
         $this->add_log(sprintf(
             '%d événements insérés, %d en base après sync.',
-            count($upcoming),
+            $inserted,
             FFCCalendarDB::count_events()
         ));
         update_option('ffc_last_sync', current_time('mysql'));

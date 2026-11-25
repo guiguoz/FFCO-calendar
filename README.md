@@ -52,9 +52,13 @@ chaque site.
 - Synchronisation : **cron WordPress le 1er du mois à 3 h**, plus un bouton
   « Synchroniser maintenant » dans l'admin (AJAX, nonce).
 - Affichage : `[ffc_calendar_ligue]` ou `[ffc_calendar_ligue month="9" year="2026"]`.
-- Chaque synchro purge les événements **à venir** puis les réinsère ; les
-  événements passés restent en base (les réinsérer créerait des doublons, leur
-  identifiant ayant changé avec le changement de source).
+- Chaque synchro **remplace chaque année civile réellement récupérée**, courses
+  passées comprises : le calendrier affiche donc aussi les mois déjà écoulés de
+  la saison. Une année dont la page est injoignable n'est pas touchée, ce qui
+  évite toute perte de données.
+- Historique conservé : `FFCCalendarDB::RETENTION_MONTHS` (18 mois par défaut,
+  dans `includes/class-ffc-db.php`). La synchro s'aligne automatiquement sur
+  cette valeur.
 - Garde-fou : si la source est joignable mais renvoie zéro course, la purge est
   annulée pour ne pas vider la base.
 
@@ -86,6 +90,11 @@ Bilan filtres : 12 en Normandie (14/27/50/61/76), 29 nationales (groupe A/B1 ou 
 Un résultat à **zéro** n'est pas nécessairement une panne : en fin de saison, la
 dernière course publiée peut être déjà passée et le calendrier de la saison
 suivante ne pas encore être en ligne. Le journal l'indique explicitement.
+
+Un mois vide dans la grille affichée est tout aussi normal : le filtre ne retient
+que les courses **normandes** et les compétitions **nationales**. Hors saison
+(novembre-décembre) il n'y a parfois aucune course de ce type dans toute la
+France — c'est un reflet fidèle du calendrier fédéral, pas un dysfonctionnement.
 
 ## Contraintes
 
