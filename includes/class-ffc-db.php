@@ -95,6 +95,35 @@ class FFCCalendarDB {
         ));
     }
 
+    /**
+     * Mois présents en base, du plus ancien au plus récent.
+     * Sert à orienter le visiteur quand le mois affiché ne contient aucune course :
+     * le calendrier fédéral s'arrête à la dernière course publiée, et la saison
+     * suivante n'est pas toujours en ligne.
+     *
+     * @return array<int, array{year:int, month:int, nb:int}>
+     */
+    public static function get_months_with_events(): array {
+        global $wpdb;
+        $table = self::get_table_name();
+        $rows  = $wpdb->get_results(
+            "SELECT YEAR(event_date) AS y, MONTH(event_date) AS m, COUNT(*) AS nb
+               FROM $table
+              GROUP BY YEAR(event_date), MONTH(event_date)
+              ORDER BY y ASC, m ASC"
+        );
+
+        $months = [];
+        foreach ((array) $rows as $row) {
+            $months[] = [
+                'year'  => (int) $row->y,
+                'month' => (int) $row->m,
+                'nb'    => (int) $row->nb,
+            ];
+        }
+        return $months;
+    }
+
     public static function delete_future_events(): void {
         global $wpdb;
         $table = self::get_table_name();
