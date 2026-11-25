@@ -68,6 +68,10 @@ class FFCCalendarDisplay {
                 <span class="ffc-legend-item ffc-legend-national">Compétition nationale</span>
             </div>
 
+            <?php if (empty($events)) : ?>
+                <?php echo $this->render_empty_notice($month, $year); // déjà échappé ?>
+            <?php endif; ?>
+
             <div class="ffc-grid-ligue">
                 <?php foreach (['Dim', 'Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'] as $d): ?>
                     <div class="ffc-day-header-ligue"><?php echo esc_html($d); ?></div>
@@ -122,6 +126,69 @@ class FFCCalendarDisplay {
         return ob_get_clean();
     }
 
+    /**
+     * Message affiché quand le mois demandé ne contient aucune course.
+     *
+     * Sans lui, le visiteur voit une grille entièrement vide et conclut que la
+     * synchronisation est cassée — alors que le calendrier fédéral s'arrête
+     * simplement à la dernière course publiée, la saison suivante n'étant pas
+     * encore en ligne sur cn.ffcorientation.fr.
+     */
+    private function render_empty_notice(int $month, int $year): string {
+        $months = FFCCalendarDB::get_months_with_events();
+
+        if (empty($months)) {
+            return '<div class="ffc-empty-ligue">'
+                . '<strong>Aucune course dans le calendrier.</strong>'
+                . ' La synchronisation n\'a pas encore alimenté la base. '
+                . 'Lancez « Synchroniser maintenant » dans Réglages → Calendrier FFC.'
+                . '</div>';
+        }
+
+        $current = $year * 12 + $month;
+        $prev    = null;
+        $next    = null;
+        foreach ($months as $m) {
+            $key = $m['year'] * 12 + $m['month'];
+            if ($key < $current && ($prev === null || $key > $prev['year'] * 12 + $prev['month'])) {
+                $prev = $m;
+            }
+            if ($key > $current && ($next === null || $key < $next['year'] * 12 + $next['month'])) {
+                $next = $m;
+            }
+        }
+        $last = $months[count($months) - 1];
+
+        $out   = '<div class="ffc-empty-ligue">';
+        $out  .= '<strong>Aucune course en ' . esc_html(self::MONTHS_FR[$month] . ' ' . $year) . '.</strong>';
+
+        if ($prev !== null) {
+            $out .= $this->month_link($prev, 'Dernières courses : %s');
+        }
+        if ($next !== null) {
+            $out .= $this->month_link($next, 'Prochaines courses : %s');
+        }
+        if ($next === null) {
+            $out .= ' Le calendrier fédéral s\'arrête à '
+                . esc_html(self::MONTHS_FR[$last['month']] . ' ' . $last['year'])
+                . ' : la saison suivante n\'est pas encore publiée sur cn.ffcorientation.fr. '
+                . 'Elle apparaîtra ici dès sa publication, sans intervention de votre part.';
+        }
+
+        return $out . '</div>';
+    }
+
+    /** Lien vers un mois donné, avec son nombre de courses. */
+    private function month_link(array $m, string $label): string {
+        $text = sprintf(
+            $label,
+            self::MONTHS_FR[$m['month']] . ' ' . $m['year'] . ' (' . $m['nb'] . ')'
+        );
+        return ' <a class="ffc-empty-link" href="'
+            . esc_url(add_query_arg(['ffc_month' => $m['month'], 'ffc_year' => $m['year']]))
+            . '">' . esc_html($text) . '</a>';
+    }
+
     private function get_css(): string {
         return '
 .ffc-calendar-ligue{max-width:100%;font-family:"Roboto",Arial,sans-serif;margin:20px 0;box-shadow:0 4px 15px rgba(0,0,0,.1);border-radius:12px;overflow:hidden}
@@ -134,6 +201,10 @@ class FFCCalendarDisplay {
 .ffc-legend-item::before{content:"";display:inline-block;width:12px;height:12px;border-radius:3px}
 .ffc-legend-regional::before{background:linear-gradient(135deg,#1e3a8a,#3b82f6)}
 .ffc-legend-national::before{background:linear-gradient(135deg,#c05621,#ed8936)}
+.ffc-empty-ligue{padding:16px 20px;background:#fffbeb;border-bottom:1px solid #fde68a;color:#78350f;font-size:14px;line-height:1.6}
+.ffc-empty-ligue strong{display:block;margin-bottom:4px;font-size:15px;color:#92400e}
+.ffc-empty-link{display:inline-block;margin:2px 8px 2px 0;padding:5px 12px;background:#fff;color:#92400e;border:1px solid #f59e0b;border-radius:20px;font-weight:600;font-size:13px;text-decoration:none}
+.ffc-empty-link:hover{background:#f59e0b;color:#fff;text-decoration:none}
 .ffc-grid-ligue{display:grid;grid-template-columns:repeat(7,1fr);background:#fff}
 .ffc-day-header-ligue{background:linear-gradient(135deg,#1e3a8a 0%,#3b82f6 100%);color:#fff;padding:12px 5px;text-align:center;font-weight:700;font-size:13px;border-right:1px solid #1e40af}
 .ffc-day-header-ligue:last-child{border-right:none}
