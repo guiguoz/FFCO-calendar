@@ -3,6 +3,16 @@ if (!defined('ABSPATH')) exit;
 
 class FFCCalendarDB {
 
+    /**
+     * Nombre de mois d'historique conservés en base.
+     *
+     * La source CN publie une saison entière (année civile) pour le même coût
+     * qu'un seul mois : conserver 18 mois permet d'afficher toute la saison en
+     * cours plus la fin de la précédente. À ajuster ici uniquement — la synchro
+     * s'aligne automatiquement sur cette valeur.
+     */
+    const RETENTION_MONTHS = 18;
+
     public static function get_table_name() {
         global $wpdb;
         return $wpdb->prefix . 'ffc_events';
@@ -92,11 +102,29 @@ class FFCCalendarDB {
         $wpdb->query("DELETE FROM `{$table}` WHERE event_date >= CURDATE()");
     }
 
-    public static function cleanup_old_events(): void {
+    /**
+     * Supprime tous les événements d'une année civile.
+     *
+     * La source CN publie une saison entière d'un coup : la synchro remplace
+     * donc l'année complète, courses passées comprises, plutôt que de ne purger
+     * que le futur. Cela évite les doublons lorsqu'une même course change
+     * d'identifiant entre deux sources.
+     */
+    public static function delete_events_for_year(int $year): void {
         global $wpdb;
         $table = self::get_table_name(); // Trusted: WP prefix + literal suffix
         // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-        $wpdb->query("DELETE FROM `{$table}` WHERE event_date < DATE_SUB(CURDATE(), INTERVAL 6 MONTH)");
+        $wpdb->query($wpdb->prepare("DELETE FROM `{$table}` WHERE YEAR(event_date) = %d", $year));
+    }
+
+    public static function cleanup_old_events(): void {
+        global $wpdb;
+        $table = self::get_table_name(); // Trusted: WP prefix + literal suffix
+        $wpdb->query($wpdb->prepare(
+            // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+            "DELETE FROM `{$table}` WHERE event_date < DATE_SUB(CURDATE(), INTERVAL %d MONTH)",
+            self::RETENTION_MONTHS
+        ));
     }
 
     public static function count_events(): int {
