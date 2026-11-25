@@ -7,8 +7,9 @@ return [
     // Départements à synchroniser
     'departments' => ['27', '76', '14', '50', '61'],
 
-    // URL source FFCO (on reste sur l'agenda FFCO)
-    'ffc_url' => 'https://www.ffcorientation.fr/courses/agenda/',
+    // URL source FFCO : base des Courses CN (l'ancien agenda
+    // /courses/agenda/ ne sert plus de tableau depuis la refonte du site)
+    'ffc_url' => 'https://cn.ffcorientation.fr/course/',
 
     // Mapping villes -> départements (à compléter selon vos besoins)
     'city_department_map' => [

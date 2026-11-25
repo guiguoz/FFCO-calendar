@@ -7,7 +7,7 @@ nationales).
 
 ## Structure
 
-### Synchronisation (source : https://www.ffcorientation.fr/courses/agenda/)
+### Synchronisation (source : https://cn.ffcorientation.fr/course/ — Courses CN)
 
 | Fichier | Rôle |
 |---|---|
