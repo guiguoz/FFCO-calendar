@@ -194,34 +194,39 @@ class FFCCalendarSync {
             return $events;
         }
 
+        $cols = $this->detect_columns($xpath);
+        $this->add_log('Colonnes : ' . $this->format_columns($cols));
+
+        $sample     = null;
+        $nb_no_link = 0;
+
         foreach ($rows as $row) {
             $cells = $xpath->query('.//td', $row);
             if ($cells->length < 4) {
                 continue;
             }
 
-            $cell_text = function (int $i) use ($cells): string {
-                $node = $cells->item($i);
-                if (!$node) {
-                    return '';
-                }
-                return trim(html_entity_decode($node->textContent, ENT_QUOTES, 'UTF-8'));
+            $cell = function (string $key) use ($cells, $cols): string {
+                $idx  = $cols[$key] ?? -1;
+                $node = ($idx >= 0) ? $cells->item($idx) : null;
+                return $node ? $this->clean_text($node->textContent) : '';
             };
 
-            $event_date = $this->parse_date($cell_text(0));
-            $title      = $cell_text(1);
-            $lieu       = $cell_text(2);
-            $groupe     = $cell_text(4);
-            $discipline = $cell_text(5); // Spécialité : Pédestre, VTT…
-            $category   = $cell_text(6); // Épreuve : MD, LD, Sprint, Nuit…
+            $event_date = $this->parse_date($cell('date'));
+            $title      = $cell('course');
+            $lieu       = $cell('lieu');
+            $organizer  = $cell('organisateur');
+            $groupe     = $cell('groupe');
+            $discipline = $cell('specialite'); // Pédestre, VTT…
+            $category   = $cell('epreuve');    // MD, LD, Sprint, Nuit…
 
             if ($event_date === null || $title === '') {
                 continue;
             }
 
             // Lien vers la fiche CN — absent pour certaines courses
-            $event_url = '';
-            $title_cell = $cells->item(1);
+            $event_url  = '';
+            $title_cell = $cells->item($cols['course']);
             $link_node  = $title_cell ? $xpath->query('.//a', $title_cell)->item(0) : null;
             if ($link_node) {
                 $href = $link_node->getAttribute('href');
@@ -230,24 +235,161 @@ class FFCCalendarSync {
                     $event_url = $this->is_allowed_url($candidate) ? $candidate : '';
                 }
             }
+            if ($event_url === '') {
+                $nb_no_link++;
+            }
 
-            $ffco_id = $this->extract_ffco_id($event_url) ?? 'cn_' . md5($event_date . '|' . $title . '|' . $lieu);
+            // Identifiant : celui de la fiche CN quand elle existe, sinon une
+            // empreinte de la ligne entière. Deux courses homonymes le même jour
+            // au même endroit ne doivent pas être confondues.
+            $ffco_id = $this->extract_ffco_id($event_url) ?? 'cn_' . md5(implode('|', [
+                $event_date, $title, $lieu, $organizer, $groupe, $discipline, $category,
+            ]));
 
-            $events[] = [
+            $event = [
                 'ffco_id'     => sanitize_text_field($ffco_id),
                 'event_date'  => $event_date,
                 'title'       => sanitize_text_field($title),
                 'location'    => sanitize_text_field($lieu),
-                'department'  => $this->normalize_department($lieu),
+                'department'  => $this->resolve_department($lieu, $cell('departement')),
                 'is_national' => $this->is_national($title, $groupe) ? 1 : 0,
                 'discipline'  => sanitize_text_field($discipline),
                 'category'    => sanitize_text_field($category),
                 'event_url'   => esc_url_raw($event_url),
                 'status'      => 'OK',
             ];
+            $events[] = $event;
+
+            if ($sample === null) {
+                $sample = sprintf(
+                    'date=%s | course=%s | lieu=%s | organisateur=%s | groupe=%s | spécialité=%s | épreuve=%s => dép.=%s',
+                    $event_date, $title, $lieu, $organizer, $groupe, $discipline, $category,
+                    $event['department'] === '' ? '(aucun)' : $event['department']
+                );
+            }
+        }
+
+        if ($sample !== null) {
+            $this->add_log('Échantillon, 1re ligne lue → ' . $sample);
+        }
+        if ($nb_no_link > 0) {
+            $this->add_log(sprintf('%d lignes sans fiche CN (identifiant calculé depuis la ligne).', $nb_no_link));
         }
 
         return $events;
+    }
+
+    /**
+     * Normalise un texte issu du DOM.
+     *
+     * PHP trim() ne retire ni U+00A0 (espace insécable produite par &nbsp;) ni
+     * U+202F (espace fine insécable, courante en typographie française), et le
+     * \s de PCRE ne les reconnaît pas davantage. Sans cette normalisation, un
+     * groupe « B1 » encadré d'insécables n'est pas détecté comme national et un
+     * lieu « Ville (14) » peut ne pas livrer son département.
+     */
+    private function clean_text(?string $raw): string {
+        if ($raw === null) {
+            return '';
+        }
+        $text = html_entity_decode($raw, ENT_QUOTES, 'UTF-8');
+        $text = preg_replace('/[\x{00A0}\x{2000}-\x{200B}\x{202F}\x{205F}\x{3000}\x{FEFF}]/u', ' ', $text);
+        $text = preg_replace('/\s+/u', ' ', (string) $text);
+        return trim($text);
+    }
+
+    /**
+     * Département de la course : lu dans le lieu (« Ville (14) ») en priorité,
+     * à défaut dans une éventuelle colonne dédiée du tableau CN.
+     */
+    private function resolve_department(string $lieu, string $dept_brut): string {
+        $dept = $this->normalize_department($lieu);
+        if ($dept !== '') {
+            return $dept;
+        }
+        if ($dept_brut === '') {
+            return '';
+        }
+        $code = $this->normalize_dept_code($dept_brut);
+        if ($code === '' || !ctype_digit($code)) {
+            return '';
+        }
+        $num = (int) $code;
+        return (($num >= 1 && $num <= 95) || ($num >= 971 && $num <= 976)) ? $code : '';
+    }
+
+    /**
+     * Détermine l'index de chaque colonne d'après la ligne d'en-tête, avec repli
+     * sur l'ordre connu. Résiste à un ajout ou à un réordonnancement côté CN.
+     */
+    private function detect_columns(DOMXPath $xpath): array {
+        $cols = [
+            'date' => 0, 'course' => 1, 'lieu' => 2, 'organisateur' => 3,
+            'groupe' => 4, 'specialite' => 5, 'epreuve' => 6,
+            // Colonne dédiée absente du tableau actuel : -1 = ne pas lire.
+            'departement' => -1,
+        ];
+
+        $header_row = $xpath->query('//table//tr[th]')->item(0);
+        if (!$header_row) {
+            $this->add_log('En-tête du tableau absent : ordre de colonnes par défaut supposé.');
+            return $cols;
+        }
+
+        $detected = [];
+        foreach ($xpath->query('.//th', $header_row) as $idx => $th) {
+            $key = $this->header_key($th->textContent);
+            if ($key !== null && !isset($detected[$key])) {
+                $detected[$key] = $idx;
+            }
+        }
+
+        if ($detected === []) {
+            $this->add_log('En-tête du tableau non reconnu : ordre de colonnes par défaut supposé.');
+            return $cols;
+        }
+
+        return array_merge($cols, $detected);
+    }
+
+    /** @return string|null Clé de colonne reconnue dans un libellé d'en-tête. */
+    private function header_key(?string $label): ?string {
+        if ($label === null) {
+            return null;
+        }
+        $label = mb_strtolower($this->clean_text($label));
+        $label = strtr($label, [
+            'à' => 'a', 'â' => 'a', 'ä' => 'a', 'é' => 'e', 'è' => 'e',
+            'ê' => 'e', 'ë' => 'e', 'î' => 'i', 'ï' => 'i', 'ô' => 'o',
+            'ö' => 'o', 'ù' => 'u', 'û' => 'u', 'ü' => 'u', 'ç' => 'c',
+        ]);
+
+        // « résultats » n'est volontairement pas reconnu : colonne ignorée.
+        static $map = [
+            'date'         => 'date',
+            'course'       => 'course',
+            'lieu'         => 'lieu',
+            'ville'        => 'lieu',
+            'organisateur' => 'organisateur',
+            'departement'  => 'departement',
+            'groupe'       => 'groupe',
+            'specialite'   => 'specialite',
+            'epreuve'      => 'epreuve',
+        ];
+        foreach ($map as $needle => $key) {
+            if (str_contains($label, $needle)) {
+                return $key;
+            }
+        }
+        return null;
+    }
+
+    private function format_columns(array $cols): string {
+        $parts = [];
+        foreach ($cols as $key => $idx) {
+            $parts[] = $key . '=' . $idx;
+        }
+        return implode(', ', $parts);
     }
 
     /**
@@ -260,24 +402,44 @@ class FFCCalendarSync {
 
         $min = null;
         $max = null;
-        $nb_normandie = 0;
-        $nb_national  = 0;
+        $nb_national = 0;
+        $nb_dept     = 0;
+        $nb_kw       = 0;
 
+        // Même ordre de priorité que filter_normandie(), pour que les compteurs
+        // annoncés ici correspondent exactement au résultat du filtre.
         foreach ($events as $e) {
             if ($min === null || $e['event_date'] < $min) { $min = $e['event_date']; }
             if ($max === null || $e['event_date'] > $max) { $max = $e['event_date']; }
-            if (in_array($e['department'], self::NORMANDIE_DEPTS, true)) { $nb_normandie++; }
-            if (!empty($e['is_national'])) { $nb_national++; }
+
+            if (!empty($e['is_national'])) {
+                $nb_national++;
+            } elseif (in_array($e['department'], self::NORMANDIE_DEPTS, true)) {
+                $nb_dept++;
+            } elseif ($this->is_normandie_by_keyword($e['title'], $e['location'])) {
+                $nb_kw++;
+            }
         }
 
         $this->add_log(sprintf('Bilan source : %d courses, du %s au %s.', count($events), $min, $max));
         $this->add_log(sprintf(
-            'Bilan filtres : %d en Normandie (%s), %d nationales (groupe %s ou titre).',
-            $nb_normandie,
-            implode('/', self::NORMANDIE_DEPTS),
+            'Bilan filtres : %d nationales (groupe %s ou titre), %d normandes par département (%s), %d par mot-clé.',
             $nb_national,
-            implode('/', self::NATIONAL_GROUPS)
+            implode('/', self::NATIONAL_GROUPS),
+            $nb_dept,
+            implode('/', self::NORMANDIE_DEPTS),
+            $nb_kw
         ));
+
+        if (count($events) >= 50 && $nb_national === 0 && $nb_dept === 0) {
+            $this->add_log(sprintf(
+                "ANOMALIE : aucune course nationale ni normande détectée sur %d lignes. Une saison "
+                . "complète en contient normalement plusieurs dizaines. Comparer l'échantillon ci-dessus "
+                . "au tableau de cn.ffcorientation.fr/course/ : ordre ou contenu des colonnes "
+                . 'probablement modifié côté fédération.',
+                count($events)
+            ));
+        }
 
         $today = date('Y-m-d');
         if ($max !== null && $max < $today) {
@@ -354,8 +516,9 @@ class FFCCalendarSync {
     }
 
     private function normalize_department(string $lieu): string {
-        // Strategy 1: explicit "(14)" or "(076)" pattern
-        if (preg_match('/\((\d{2,3})\)/', $lieu, $m)) {
+        // Strategy 1: explicit "(14)" or "(076)" pattern.
+        // Des espaces peuvent s'y glisser (insécables normalisées par clean_text).
+        if (preg_match('/\(\s*(\d{2,3})\s*\)/u', $lieu, $m)) {
             $code = $this->normalize_dept_code($m[1]);
             $num  = (int) $code;
             if ($code !== '' && (($num >= 1 && $num <= 95) || ($num >= 971 && $num <= 976))) {
