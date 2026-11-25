@@ -11,18 +11,15 @@ Installée sur **deux sites**, avec le même code et le même comportement :
 Affichage via le shortcode `[ffc_calendar_ligue]` (utilisé notamment dans une
 page Elementor).
 
-## Source des données
+## Sources des données
 
-**`https://cn.ffcorientation.fr/course/`** — le site « Courses CN ».
+Deux sources complémentaires, fusionnées à chaque synchro.
 
-L'ancien agenda `https://www.ffcorientation.fr/courses/agenda/` ne sert plus
-aucune donnée depuis la refonte du site fédéral (thème `ffco2026`) :
+### 1. Courses CN — `https://cn.ffcorientation.fr/course/`
 
-- la page « Agenda des manifestations » n'est plus qu'une page de renvoi vers un
-  formulaire Jotform, sans tableau ni liste d'événements ;
-- le WordPress fédéral n'expose aucun type de contenu « événement » (vérifié via
-  `/wp-json/wp/v2/types`) ;
-- les exports ICS et CSV ont disparu avec l'ancien agenda.
+La référence pour les **compétitions** : groupe exact (`A`/`B1`/`B2`/`D`) et fiche
+de course. Une seule saison par page (`?season=AAAA`) : année courante et année
+suivante sont interrogées puis fusionnées.
 
 Le tableau CN comporte 8 colonnes :
 
@@ -41,6 +38,38 @@ conserve l'ordre du document. **Ne pas revenir à `.//td`.**
 ⚠️ **La page CN n'affiche qu'une saison à la fois** (`?season=AAAA`), et la
 saison suit l'année civile. Toute période à cheval sur deux années doit donc être
 récupérée en deux requêtes — c'est ce que fait la synchro.
+
+### 2. Agenda fédéral — `https://api.ffcorientation.fr/iframe/agenda/liste/`
+
+Découvert par la fiche d'événement vers laquelle renvoie le site fédéral
+(`/iframe/courses/{id}/`). Lui seul référence les **manifestations hors classement
+national** (raids, nocturnes, animations) et les **saisons que le CN n'a pas
+encore publiées** : c'est lui qui apporte par exemple la « Ca te dit Night Fever »
+de Vik'Azim, absente du CN par nature.
+
+| Paramètre | Rôle |
+| --- | --- |
+| `du=AAAA-MM-JJ` | date de départ ; sans paramètre, aujourd'hui |
+| `page=N` | pagination, 20 lignes par page ; le pied de tableau indique `Page 1/13` |
+
+Six colonnes : `Date | CN | Événement | Lieu | Discipline | Format`. Particularités
+gérées : dates sur **deux chiffres** (`28/11/26` → 2026), lieu parfois **vide**,
+colonne `CN` (`oui`/`non`) qui indique seulement si la course compte pour le
+classement national — **pas** son niveau —, et groupe **absent** : le niveau
+national y est donc déduit du titre (`Nationales`, `Sélections`, plus les motifs
+habituels), les championnats de ligue restant exclus.
+
+**Fusion :** une ligne d'agenda dont la signature (date, titre, lieu) existe déjà
+côté CN est ignorée — le CN fait foi pour le groupe et l'URL de fiche. L'agenda est
+interrogé à partir d'aujourd'hui : le passé compétitif vient du CN, l'avenir des
+deux sources.
+
+L'ancien agenda `https://www.ffcorientation.fr/courses/agenda/`, lui, ne sert plus
+rien depuis la refonte du site fédéral (thème `ffco2026`) : il **redirige** vers une
+page statique — sans tableau, sans JSON, avec pour seul élément dynamique un agent
+Jotform (« Nathali ») sur lequel on ne peut pas bâtir une synchro. Le WordPress
+fédéral n'expose aucune route d'agenda (`/wp-json/`), et le point d'entrée
+`/iframe/agenda/export/` répond HTTP 500 : seule la liste paginée est fiable.
 
 ### Filtrage
 
@@ -116,6 +145,8 @@ Bilan filtres : 22 nationales (groupe A/B1 ou titre), 10 normandes par départem
   (14/27/50/61/76), 0 par mot-clé.
 Filtre : 22 nationaux + 10 Normandie conservés, 212 exclus (autres régions).
 Année 2026 : 32 événements réinsérés.
+Agenda FFCO : pages 1 à 13 lues, à partir du 2026-11-25.
+Agenda FFCO : 251 courses à venir lues, 19 conservées après dédoublonnage avec le CN.
 ```
 
 Les quatre premières lignes existent pour rendre un futur changement du tableau CN

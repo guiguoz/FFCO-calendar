@@ -4,26 +4,37 @@ if (!defined('ABSPATH')) exit;
 /**
  * Synchronisation du calendrier depuis le site fédéral « Courses CN ».
  *
- * Source actuelle : https://cn.ffcorientation.fr/course/
+ * Deux sources complémentaires :
  *
- * L'ancien agenda https://www.ffcorientation.fr/courses/agenda/ ne sert plus
- * aucune donnée depuis la refonte du site fédéral (thème ffco2026) :
- *   - la page « Agenda des manifestations » n'est plus qu'une page de renvoi
- *     vers un formulaire Jotform, sans tableau ni liste d'événements ;
- *   - le WordPress fédéral n'expose aucun type de contenu « événement »
- *     (vérifié via /wp-json/wp/v2/types) ;
- *   - les exports ICS et CSV ont disparu avec l'ancien agenda.
- * Les trois méthodes historiques (ics / csv / html) sont donc remplacées par
- * une seule : le tableau HTML du site Courses CN.
+ * 1. Courses CN — https://cn.ffcorientation.fr/course/
+ *    La référence pour les compétitions : groupe exact (A/B1/B2/D) et fiche de
+ *    course. Particularité : une seule saison par page (?season=AAAA), donc
+ *    année courante + année suivante, fusionnées par identifiant.
  *
- * Particularité du CN : la page n'affiche qu'UNE saison à la fois
- * (?season=AAAA). On interroge l'année courante et l'année suivante, puis on
- * fusionne en dédupliquant par identifiant de course.
+ * 2. Agenda fédéral — https://api.ffcorientation.fr/iframe/agenda/liste/
+ *    Découvert via la fiche d'événement pointée par le site fédéral. Lui seul
+ *    référence les manifestations HORS classement national (raids, nocturnes,
+ *    animations) et les saisons que le CN n'a pas encore publiées : c'est lui
+ *    qui fournit par exemple la « Ca te dit Night Fever » de Vik'Azim.
+ *    Listes paginées (?du=AAAA-MM-JJ&page=N), tableau
+ *    Date | CN | Événement | Lieu | Discipline | Format, dates sur deux
+ *    chiffres (28/11/26).
+ *
+ * Les deux sont fusionnées : une course déjà fournie par le CN (groupe et
+ * fiche exacts) n'est pas doublée par sa fiche agenda. L'ancien agenda
+ * /courses/agenda/ du site fédéral, lui, ne sert plus rien depuis la refonte
+ * ffco2026 : il redirige vers une page statique dotée d'un simple agent Jotform.
  */
 class FFCCalendarSync {
 
     const CN_BASE        = 'https://cn.ffcorientation.fr';
     const CN_COURSE_LIST = 'https://cn.ffcorientation.fr/course/';
+
+    const FFCO_API_BASE    = 'https://api.ffcorientation.fr';
+    const FFCO_AGENDA_LIST = 'https://api.ffcorientation.fr/iframe/agenda/liste/';
+
+    /** Garde-fou : nombre maximal de pages d'agenda lues en une synchro. */
+    const AGENDA_MAX_PAGES = 60;
 
     const NORMANDIE_DEPTS = ['14', '27', '50', '61', '76'];
 
@@ -143,11 +154,30 @@ class FFCCalendarSync {
             }
         }
 
+        // Seconde source : l'agenda fédéral. Il apporte ce que le CN ne
+        // référencera jamais (manifestations hors classement) ou pas encore
+        // (saison suivante non publiée). À partir d'aujourd'hui : le passé
+        // compétitif vient du CN, l'agenda couvre l'avenir.
+        $cn_keys = [];
+        foreach ($events as $existing) {
+            $cn_keys[$this->event_fingerprint($existing)] = true;
+        }
+
+        $agenda = $this->fetch_agenda_events(date('Y-m-d'));
+        if ($agenda !== null) {
+            $reached = true;
+            $added   = $this->merge_agenda_events($agenda, $events, $seen, $cn_keys);
+            $this->add_log(sprintf(
+                'Agenda FFCO : %d courses à venir lues, %d conservées après dédoublonnage avec le CN.',
+                count($agenda), $added
+            ));
+        }
+
         if (!$reached) {
             return false;
         }
 
-        update_option('ffc_fetch_method', 'cn_html');
+        update_option('ffc_fetch_method', 'cn_html+agenda');
         $this->log_bilan($events);
 
         return $events;
@@ -172,6 +202,179 @@ class FFCCalendarSync {
             $added++;
         }
         return $added;
+    }
+
+    /**
+     * Fusion spécifique à l'agenda : outre l'identifiant, une ligne dont la
+     * signature (date, titre, lieu) existe déjà côté CN est ignorée — le CN fait
+     * foi pour le groupe et l'URL de fiche.
+     */
+    private function merge_agenda_events(array $parsed, array &$events, array &$seen, array $cn_keys): int {
+        $added = 0;
+        foreach ($parsed as $event) {
+            $id = $event['ffco_id'];
+            if (isset($seen[$id]) || isset($cn_keys[$this->event_fingerprint($event)])) {
+                continue;
+            }
+            $seen[$id] = true;
+            $events[]  = $event;
+            $added++;
+        }
+        return $added;
+    }
+
+    /** Signature permettant de reconnaître une même course entre deux sources. */
+    private function event_fingerprint(array $event): string {
+        return md5(implode('|', [
+            $event['event_date'],
+            mb_strtolower($event['title']),
+            mb_strtolower($event['location']),
+        ]));
+    }
+
+    /**
+     * Lit l'agenda fédéral page par page, à partir de la date donnée.
+     *
+     * @return array|null Lignes lues, ou null si la première page est injoignable
+     */
+    private function fetch_agenda_events(string $from): ?array {
+        $rows  = [];
+        $pages = 0;
+
+        for ($page = 1; $page <= self::AGENDA_MAX_PAGES; $page++) {
+            $url  = self::FFCO_AGENDA_LIST . '?du=' . $from . '&page=' . $page;
+            $html = $this->http_get($url);
+
+            if ($html === null) {
+                if ($page === 1) {
+                    $this->add_log('Agenda FFCO injoignable — ' . $url);
+                    return null;
+                }
+                break;
+            }
+
+            $parsed = $this->parse_agenda_page($html, $page === 1);
+            if ($parsed === []) {
+                break;
+            }
+            foreach ($parsed as $event) {
+                $rows[] = $event;
+            }
+            $pages = $page;
+
+            // Le pied de tableau indique « Page 1/13 » : on s'arrête à la dernière.
+            if (preg_match('/Page\s*(\d+)\s*\/\s*(\d+)/u', $html, $m) && (int) $m[1] >= (int) $m[2]) {
+                break;
+            }
+        }
+
+        if ($pages > 0) {
+            $this->add_log(sprintf('Agenda FFCO : pages 1 à %d lues, à partir du %s.', $pages, $from));
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Parse le tableau de l'agenda fédéral :
+     * Date | CN | Événement | Lieu | Discipline | Format
+     *
+     * Différences avec le CN, toutes gérées ici : dates sur deux chiffres
+     * (28/11/26), colonne « CN » (oui/non) qui ne préjuge pas du niveau, lieu
+     * parfois vide, et lien de fiche sur api.ffcorientation.fr.
+     */
+    private function parse_agenda_page(string $html, bool $verbose = false): array {
+        $events = [];
+
+        libxml_use_internal_errors(true);
+        $dom = new DOMDocument();
+        $dom->loadHTML('<?xml encoding="UTF-8">' . $html, LIBXML_NOWARNING | LIBXML_NOERROR);
+        libxml_clear_errors();
+
+        $xpath = new DOMXPath($dom);
+        $rows  = $xpath->query('//table//tr[td]');
+        if (!$rows || $rows->length === 0) {
+            return $events;
+        }
+
+        $cols = $this->detect_columns($xpath, [
+            'date' => 0, 'cn' => 1, 'course' => 2, 'lieu' => 3,
+            'specialite' => 4, 'epreuve' => 5,
+            'organisateur' => -1, 'groupe' => -1, 'departement' => -1,
+        ]);
+        if ($verbose) {
+            $this->add_log('Colonnes agenda : ' . $this->format_columns($cols));
+        }
+
+        foreach ($rows as $row) {
+            $cells = $xpath->query('.//th | .//td', $row);
+            if ($cells->length < 4) {
+                continue;
+            }
+
+            $cell = function (string $key) use ($cells, $cols): string {
+                $idx  = $cols[$key] ?? -1;
+                $node = ($idx >= 0) ? $cells->item($idx) : null;
+                return $node ? $this->clean_text($node->textContent) : '';
+            };
+
+            $event_date = $this->parse_date($cell('date'));
+            $title      = $cell('course');
+            $lieu       = $cell('lieu');
+            $discipline = $cell('specialite'); // Pédestre, VTT, Raid Orientation…
+            $category   = $cell('epreuve');    // MD, LD, Sprint, Nuit, Raid…
+
+            if ($event_date === null || $title === '') {
+                continue;
+            }
+
+            $event_url  = '';
+            $title_cell = $cells->item($cols['course']);
+            $link_node  = $title_cell ? $xpath->query('.//a', $title_cell)->item(0) : null;
+            if ($link_node) {
+                $href = $link_node->getAttribute('href');
+                if ($href !== '') {
+                    $candidate = (strpos($href, 'http') === 0) ? $href : self::FFCO_API_BASE . $href;
+                    $event_url = $this->is_allowed_url($candidate) ? $candidate : '';
+                }
+            }
+
+            $ffco_id = $this->extract_ffco_id($event_url) ?? 'agenda_' . md5(implode('|', [
+                $event_date, $title, $lieu, $discipline, $category,
+            ]));
+
+            $events[] = [
+                'ffco_id'     => sanitize_text_field($ffco_id),
+                'event_date'  => $event_date,
+                'title'       => sanitize_text_field($title),
+                'location'    => sanitize_text_field($lieu),
+                'department'  => $this->resolve_department($lieu, ''),
+                'is_national' => $this->is_national_from_agenda($title) ? 1 : 0,
+                'discipline'  => sanitize_text_field($discipline),
+                'category'    => sanitize_text_field($category),
+                'event_url'   => esc_url_raw($event_url),
+                'status'      => 'OK',
+            ];
+        }
+
+        return $events;
+    }
+
+    /**
+     * Niveau national d'après le seul titre : l'agenda ne publie pas le groupe CN.
+     *
+     * « Nationales … » et « Sélections … » sont des rendez-vous nationaux
+     * (groupe B1 au CN) dont le titre ne contient pas « Championnat de France ».
+     * Les championnats de ligue ou de région restent exclus, comme au CN.
+     */
+    private function is_national_from_agenda(string $title): bool {
+        if ($this->is_truly_national($title)) {
+            return true;
+        }
+        return (bool) preg_match(
+            '/(?<![\p{L}\p{N}])(Nationales?|S[eé]lections?)(?![\p{L}\p{N}])/iu',
+            $title
+        );
     }
 
     /**
@@ -366,8 +569,8 @@ class FFCCalendarSync {
         return $cells ? $cells->length : 0;
     }
 
-    private function detect_columns(DOMXPath $xpath): array {
-        $cols = [
+    private function detect_columns(DOMXPath $xpath, ?array $defaults = null): array {
+        $cols = $defaults ?? [
             'date' => 0, 'course' => 1, 'lieu' => 2, 'organisateur' => 3,
             'groupe' => 4, 'specialite' => 5, 'epreuve' => 6,
             // Colonne dédiée absente du tableau actuel : -1 = ne pas lire.
@@ -419,6 +622,11 @@ class FFCCalendarSync {
             'groupe'       => 'groupe',
             'specialite'   => 'specialite',
             'epreuve'      => 'epreuve',
+            // Libellés propres à l'agenda fédéral.
+            'evenement'    => 'course',
+            'discipline'   => 'specialite',
+            'format'       => 'epreuve',
+            'cn'           => 'cn',
         ];
         foreach ($map as $needle => $key) {
             if (str_contains($label, $needle)) {
@@ -635,11 +843,19 @@ class FFCCalendarSync {
             return false;
         }
         $host = parse_url($url, PHP_URL_HOST);
-        return in_array($host, ['cn.ffcorientation.fr', 'www.ffcorientation.fr', 'ffcorientation.fr'], true);
+        return in_array($host, [
+            'cn.ffcorientation.fr', 'www.ffcorientation.fr', 'ffcorientation.fr',
+            'api.ffcorientation.fr',
+        ], true);
     }
 
     /** @return string|null */
     private function extract_ffco_id(string $url) {
+        // Fiche agenda fédéral — testée avant /course/ : « /iframe/courses/N »
+        // ne doit pas être confondue avec une fiche CN.
+        if (preg_match('/\/iframe\/courses\/(\d+)/i', $url, $m)) {
+            return 'agenda_' . $m[1];
+        }
         if (preg_match('/\/course\/(\d+)/i', $url, $m)) {
             return 'cn_' . $m[1];
         }
