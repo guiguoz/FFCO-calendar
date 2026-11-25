@@ -30,6 +30,14 @@ Le tableau CN comporte 8 colonnes :
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `jj/mm/aaaa` | titre + lien `/course/{id}/` | `Ville (dép.)` | `1408 - VIK'AZIM` | `A`/`B1`/`B2`/`D` | Pédestre, VTT | MD, LD, Sprint, Nuit | icône |
 
+⚠️ **La colonne « Course » est un `<th scope="row">`, pas un `<td>`** — et c'est
+dans cette cellule que se trouve le lien `/course/{id}/`. Un XPath `.//td` la saute
+et **décale toutes les colonnes d'un cran vers la gauche** : le Lieu devient le
+titre, l'Organisateur devient le Lieu, le Groupe devient l'Organisateur… Le
+symptôme est alors `0 nationale, 0 normande` et autant de `lignes sans fiche CN`
+que de lignes lues. La synchro sélectionne donc `.//th | .//td`, dont l'union
+conserve l'ordre du document. **Ne pas revenir à `.//td`.**
+
 ⚠️ **La page CN n'affiche qu'une saison à la fois** (`?season=AAAA`), et la
 saison suit l'année civile. Toute période à cheval sur deux années doit donc être
 récupérée en deux requêtes — c'est ce que fait la synchro.
@@ -42,6 +50,12 @@ récupérée en deux requêtes — c'est ce que fait la synchro.
 - **National** : groupe CN `A` ou `B1`, ou titre contenant *Championnat de
   France*, *Critérium National*, *Coupe de France*, *Interrégionaux*.
   `B2` = championnat de **ligue** (toutes régions) → volontairement exclu.
+
+Une course est retenue si elle satisfait **l'un ou l'autre** critère : le
+calendrier affiche donc **les compétitions nationales où qu'elles aient lieu,
+plus toutes les courses normandes**. C'est le périmètre retenu pour **les deux sites**, club comme
+ligue — un licencié normand se déplace aussi pour un Championnat de France
+dans le Haut-Rhin. Les courses `D` et `B2` des autres régions sont exclues.
 
 ## Fichiers
 
@@ -89,22 +103,43 @@ détaille chaque étape :
 
 ```
 Source : https://cn.ffcorientation.fr/course/ — saisons interrogées : 2026, 2027.
-Saison 2026 : 243 lignes lues, 243 nouvelles courses.
+Colonnes : date=0, course=1, lieu=2, organisateur=3, groupe=4, specialite=5, epreuve=6, departement=-1.
+Cellules : 8 par ligne de données, 8 dans l'en-tête.
+Échantillon, 1re ligne lue → date=2026-11-22 | course=Finale Challenge Tarnais
+  | lieu=Caucalières (81) | organisateur=81 - Tarn | groupe=D | spécialité=Pédestre
+  | épreuve=MD => dép.=81
+4 lignes sans fiche CN (identifiant calculé depuis la ligne).
+Saison 2026 : 244 lignes lues, 244 nouvelles courses.
 Saison 2027 : page injoignable — https://cn.ffcorientation.fr/course/?season=2027
-Bilan source : 243 courses, du 2026-01-11 au 2026-11-22.
-Bilan filtres : 12 en Normandie (14/27/50/61/76), 29 nationales (groupe A/B1 ou titre).
-Filtre : 29 nationaux + 12 Normandie conservés, 202 exclus (autres régions).
-Année 2026 : 41 événements réinsérés.
+Bilan source : 244 courses, du 2026-01-11 au 2026-11-22.
+Bilan filtres : 22 nationales (groupe A/B1 ou titre), 10 normandes par département
+  (14/27/50/61/76), 0 par mot-clé.
+Filtre : 22 nationaux + 10 Normandie conservés, 212 exclus (autres régions).
+Année 2026 : 32 événements réinsérés.
 ```
+
+Les quatre premières lignes existent pour rendre un futur changement du tableau CN
+auto-diagnostiquant :
+
+| Ligne | Ce qu'elle révèle |
+| --- | --- |
+| `Colonnes :` | les index réellement utilisés, d'après les libellés d'en-tête |
+| `Cellules : N par ligne de données, M dans l'en-tête` | si `N ≠ M`, un `DÉCALAGE` est signalé dans la foulée |
+| `Échantillon, 1re ligne lue →` | la valeur lue pour chaque champ : un décalage d'une colonne y est immédiatement visible |
+| `N lignes sans fiche CN` | doit rester proche de 0 ; s'il vaut le nombre de lignes, les liens ne sont pas atteints |
 
 Un résultat à **zéro** n'est pas nécessairement une panne : en fin de saison, la
 dernière course publiée peut être déjà passée et le calendrier de la saison
-suivante ne pas encore être en ligne. Le journal l'indique explicitement.
+suivante ne pas encore être en ligne. Le journal l'indique explicitement — et
+signale par une ligne `ANOMALIE` le cas inverse, où des dizaines de lignes lues
+n'auraient donné aucune nationale ni aucune normande.
 
 Un **mois vide** dans la grille est tout aussi normal : le filtre ne retient que
-les courses normandes et les compétitions nationales. Hors saison
-(novembre-décembre), il n'y a parfois aucune course de ce type dans toute la
-France — c'est un reflet fidèle du calendrier fédéral, pas un dysfonctionnement.
+les courses normandes et les compétitions nationales, et le CN s'arrête à la
+dernière course publiée. La grille ne se contente plus de rester blanche : un
+bandeau explique l'absence de courses, propose un lien vers le dernier mois qui
+en contient (et vers le suivant s'il existe), et précise que la saison suivante
+apparaîtra d'elle-même dès sa publication.
 
 ## Contraintes
 
